@@ -33,6 +33,7 @@ bot_state = {
     "checker_running":       False,
     "logs":                  [],
     "awaiting_add_accounts": False,
+    "swap_all_running":      False,
 }
 
 # ═══════════════════════════════════════════════════
@@ -111,6 +112,9 @@ def main_menu_keyboard():
         [
             InlineKeyboardButton("➕ Add Accounts",        callback_data="add_accounts"),
             InlineKeyboardButton("🗑 Remove All Accounts", callback_data="remove_accounts"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Swap All → USDC",    callback_data="swap_all"),
         ],
         [
             InlineKeyboardButton("View Logs",             callback_data="view_logs"),
@@ -312,6 +316,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     # ── Back to Main Menu ──────────────────────────
+    elif data == "swap_all":
+        if not is_owner(update):
+            await query.answer("⛔ Owner only.", show_alert=True)
+            return
+        if not bot_state["phrase_loaded"] or not bot_state["mnemonics"]:
+            await query.edit_message_text(
+                lux("SWAP ALL → USDC", ["❌ No accounts loaded.", "Upload phrase file first."]),
+                parse_mode="HTML", reply_markup=back_menu()
+            )
+            return
+        if bot_state.get("swap_all_running"):
+            await query.answer("⚠️ Swap already running.", show_alert=True)
+            return
+        await query.edit_message_text(
+            lux("SWAP ALL → USDC", [
+                f"🔄 Starting swap for {len(bot_state['mnemonics'])} wallets...",
+                "",
+                "Converting CC + cETH → USDCx",
+                "This may take a few minutes.",
+            ]),
+            parse_mode="HTML", reply_markup=back_menu()
+        )
+        asyncio.create_task(run_swap_all_task(query))
+
     elif data == "back_main":
         phrase_status = (
             f"LOADED  ({len(bot_state['mnemonics'])} accounts)"
@@ -590,6 +618,72 @@ async def run_checker_task(query):
     finally:
         bot_state["checker_running"] = False
         add_log("Checker finished")
+
+
+# ═══════════════════════════════════════════════════
+#  SWAP ALL → USDC TASK
+# ═══════════════════════════════════════════════════
+
+async def run_swap_all_task(query):
+    bot_state["swap_all_running"] = True
+    add_log("Swap All started")
+
+    def progress(done, total):
+        add_log(f"Swap All progress: {done}/{total}")
+
+    try:
+        result = await asyncio.to_thread(
+            core.run_swap_all,
+            bot_state["mnemonics"],
+            bot_state["proxies"],
+            progress,
+        )
+
+        accounts = result.get("accounts", [])
+
+        # ringkasan per wallet (max 20 baris biar ga ke-truncate Telegram)
+        acc_lines = []
+        for acc in accounts[:20]:
+            idx     = acc.get("idx", "?")
+            before  = acc.get("usdc_before", 0)
+            after   = acc.get("usdc_after", 0)
+            gained  = acc.get("usdc_gained", 0)
+            skipped = acc.get("skipped", False)
+            err     = acc.get("error")
+            if err:
+                acc_lines.append(f"  [{idx:>3}]  ❌ failed")
+            elif skipped:
+                acc_lines.append(f"  [{idx:>3}]  ⏭  skipped  (USDCx {after:.4f})")
+            else:
+                acc_lines.append(f"  [{idx:>3}]  ✅ +{gained:.4f} USDCx  →  {after:.4f}")
+
+        if len(accounts) > 20:
+            acc_lines.append(f"  ... and {len(accounts)-20} more")
+
+        lines = [
+            f"Wallets     ·  {result['total']}",
+            f"Success     ·  {result['success']}",
+            f"Skipped     ·  {result['skipped']}   (cETH terlalu kecil)",
+            f"Failed      ·  {result['failed']}",
+            "",
+            f"Total Gain  ·  +{result['total_gained']:.4f} USDCx",
+            "",
+        ] + acc_lines
+
+        await query.edit_message_text(
+            lux("SWAP ALL COMPLETE", lines),
+            parse_mode="HTML", reply_markup=back_menu()
+        )
+
+    except Exception as e:
+        add_log(f"Swap All error: {e}")
+        await query.edit_message_text(
+            lux("SWAP ALL FAILED", [str(e)]),
+            parse_mode="HTML", reply_markup=back_menu()
+        )
+    finally:
+        bot_state["swap_all_running"] = False
+        add_log("Swap All finished")
 
 
 # ═══════════════════════════════════════════════════
