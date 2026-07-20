@@ -16,8 +16,9 @@ CHALLENGE_URL = f"{CANTOR_BASE}/api/auth/challenge"
 LOGIN_URL     = f"{CANTOR_BASE}/api/auth/login"
 BALANCE_URL   = f"{CANTOR_BASE}/api/balance"
 OFFERS_URL    = f"{CANTOR_BASE}/api/offers_v2"
-PREPARE_URL   = f"{CANTOR_BASE}/api/transfer/prepare"
-EXECUTE_URL   = f"{CANTOR_BASE}/api/transaction/execute"
+PREPARE_URL      = f"{CANTOR_BASE}/api/transfer/prepare"
+PREPARE_SWAP_URL = f"{CANTOR_BASE}/api/swap/offer/prepare"   # etu.py-style, untuk cETH→USDCx
+EXECUTE_URL      = f"{CANTOR_BASE}/api/transaction/execute"
 
 VECTOR_BASE       = "https://api.vectornine.tech"
 NONCE_URL         = f"{VECTOR_BASE}/auth/nonce"
