@@ -2,6 +2,7 @@ import requests
 import hashlib
 import base64
 import datetime
+from datetime import timedelta
 import os
 import time
 import random
@@ -1003,3 +1004,339 @@ def run_trader_batch(mnemonics, proxy_list, batch_size=5, batch_delay=(30, 60),
         status_callback(f"All batches launched. Total wallets: {total}")
 
     return active_threads, active_events
+
+
+# ═══════════════════════════════════════════════════
+#  SWAP ALL → USDC  (referensi: etu.py)
+#  BUY mode = cETH → USDCx lewat VectorNine + new-format prepare
+# ═══════════════════════════════════════════════════
+
+_SWAP_USDC_CFG = {
+    "quote_payload": {
+        "fromChain": "CC",
+        "fromAsset": "CETH",
+        "toChain":   "CC",
+        "toAsset":   "USDCX",
+    },
+    "instrument_out": {
+        "admin": "rails-cethMain-1::12200350ba6e96e3b701c3048b5aa013a8c1c08833e8ebf54339cff581055c29003a",
+        "id":    "cETH",
+    },
+    "instrument_in": {
+        "admin": "decentralized-usdc-interchain-rep::12208115f1e168dd7e792320be9c4ca720c751a02a3053c7606e1c1cd3dad9bf60ef",
+        "id":    "USDCx",
+    },
+}
+
+MIN_CETH_TO_SWAP  = 0.00001   # minimum cETH yang worth di-swap
+MIN_CC_TO_SELL    = 5.0       # minimum CC sebelum di-jual ke cETH dulu
+
+
+def _get_quote_usdc(hs: HumanSession, vector_token, ceth_amount):
+    """Quote cETH → USDCx dari VectorNine."""
+    payload = {
+        **_SWAP_USDC_CFG["quote_payload"],
+        "sendAmount": str(ceth_amount),
+    }
+    r = hs.post(
+        config.QUOTES_URL,
+        headers={**hs.vector_headers, "authorization": f"Bearer {vector_token}"},
+        json=payload,
+        use_cantor=False,
+    )
+    if r.status_code != 200:
+        return None
+    return r.json()
+
+
+def _create_order_usdc(hs: HumanSession, vector_token, quote_id, party_id, max_retry=10):
+    """Buat order cETH→USDCx di VectorNine (isDvp=True seperti etu.py)."""
+    for _ in range(max_retry):
+        order_id = generate_order_id()
+        r = hs.post(
+            config.ORDERS_URL,
+            headers={**hs.vector_headers, "authorization": f"Bearer {vector_token}"},
+            json={
+                "orderId":   order_id,
+                "quoteId":   quote_id,
+                "toAddress": party_id,
+                "isDvp":     True,
+            },
+            use_cantor=False,
+        )
+        if r.status_code == 429:
+            return "SERVICE_DOWN"
+        try:
+            order = r.json()
+        except Exception:
+            time.sleep(2)
+            continue
+        if not isinstance(order, dict):
+            time.sleep(2)
+            continue
+
+        order["generatedOrderId"] = order_id
+
+        detail = order.get("detail", {})
+        if isinstance(detail, dict) and detail.get("error") == "ORDER_EXISTS_ACTIVE":
+            time.sleep(30)
+            continue
+        if isinstance(detail, str) and "quote expired" in detail.lower():
+            return "QUOTE_EXPIRED"
+        if "deposit" in order and isinstance(order["deposit"], dict):
+            return order
+        if isinstance(detail, dict) and detail.get("error") == "INSUFFICIENT_USER_BALANCE":
+            available = detail.get("available")
+            if available and float(available) > 0:
+                return {"RETRY_AVAILABLE": float(available)}
+        if isinstance(detail, str) and ("unavailable" in detail.lower() or "service" in detail.lower()):
+            return "SERVICE_DOWN"
+        return None
+    return None
+
+
+def _prepare_transfer_swap(hs: HumanSession, cantor_token, order, quote):
+    """Prepare pakai format baru (etu.py): swap object + x-feat-decimals header."""
+    expires_at = datetime.datetime.fromisoformat(
+        order["deposit"]["expiresAt"].replace("Z", "+00:00")
+    )
+    settle_before = (
+        expires_at + timedelta(minutes=5)
+    ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+    payload = {
+        "swap": {
+            "swap_id":           order["orderId"],
+            "acceptor_party_id": order["deposit"]["address"],
+            "instrument_out":    _SWAP_USDC_CFG["instrument_out"],
+            "amount_out":        order["requiredAmount"],
+            "instrument_in":     _SWAP_USDC_CFG["instrument_in"],
+            "amount_in":         quote["receiveAmount"],
+            "settle_before":     settle_before,
+        }
+    }
+    headers = {
+        **hs.cantor_headers,
+        "authorization":   f"Bearer {cantor_token}",
+        "x-feat-decimals": "1",
+    }
+    r = hs.post(config.PREPARE_SWAP_URL, headers=headers, json=payload)
+    return r.json()
+
+
+def _execute_swap_usdc(hs: HumanSession, cantor_token, vector_token,
+                       prepared, signing_key, order_id):
+    """Execute + tunggu USDCx balance naik (mirip execute_transaction di core)."""
+    before_canton, _, before_usdc, _ = get_balance(hs, cantor_token)
+
+    sig = sign_hash_b64(signing_key, prepared["hash_b64"])
+    payload = {
+        "command_id":              prepared["command_id"],
+        "prepared_tx_b64":         prepared["prepared_tx_b64"],
+        "hashing_scheme_version":  prepared["hashing_scheme_version"],
+        "signature_b64":           sig,
+    }
+    r = hs.post(
+        config.EXECUTE_URL,
+        headers={**hs.cantor_headers, "authorization": f"Bearer {cantor_token}"},
+        json=payload,
+        timeout=300,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Execute failed: {r.text}")
+
+    # Tunggu USDCx balance naik (max 5 menit)
+    for _ in range(150):
+        time.sleep(2)
+        _, _, after_usdc, _ = get_balance(hs, cantor_token)
+        if (after_usdc - before_usdc) > 0.0001:
+            return after_usdc - before_usdc
+    return "TIMEOUT"
+
+
+def _swap_ceth_to_usdc(hs: HumanSession, cantor_token, vector_token,
+                       signing_key, ceth_amount, party_id, log):
+    """Swap cETH → USDCx: quote → order → prepare(v2) → execute."""
+    current_amount = float(ceth_amount)
+
+    for attempt in range(5):
+        if not wait_until_no_active_order(hs, vector_token):
+            return None
+
+        quote = _get_quote_usdc(hs, vector_token, current_amount)
+        if not quote or "quoteId" not in quote:
+            log(f"Quote failed: {quote}")
+            return None
+
+        order = _create_order_usdc(hs, vector_token, quote["quoteId"], party_id)
+
+        if order == "SERVICE_DOWN":
+            return "SERVICE_DOWN"
+        if order == "QUOTE_EXPIRED":
+            log("Quote expired, retrying...")
+            time.sleep(10)
+            continue
+        if isinstance(order, dict) and "RETRY_AVAILABLE" in order:
+            current_amount = order["RETRY_AVAILABLE"]
+            log(f"Insufficient balance, retry with {current_amount:.6f} cETH")
+            continue
+        if not order or not isinstance(order, dict):
+            return None
+
+        prepared = _prepare_transfer_swap(hs, cantor_token, order, quote)
+        if not prepared or "hash_b64" not in prepared:
+            log(f"Prepare failed: {prepared}")
+            # retry dengan amount sedikit dikurangi
+            current_amount = round(current_amount - 0.000001, 6)
+            if current_amount <= 0:
+                return None
+            continue
+
+        result = _execute_swap_usdc(
+            hs, cantor_token, vector_token,
+            prepared, signing_key, order.get("generatedOrderId", "UNKNOWN")
+        )
+
+        if result == "TIMEOUT":
+            log("Swap execute timeout")
+            return None
+
+        return result  # USDCx received
+
+    return None
+
+
+def swap_all_to_usdc_single(idx, mnemonic, proxy_list, log=None):
+    """
+    Swap semua aset (CC + cETH) ke USDCx untuk satu wallet.
+    Step 1: Kalau ada CC → SELL CC ke cETH dulu (pakai flow existing).
+    Step 2: Swap cETH → USDCx (etu.py flow).
+    Return: dict hasil, atau None kalau gagal.
+    """
+    def _log(msg):
+        if log:
+            log(f"[{idx}] {msg}")
+
+    try:
+        hs = HumanSession(proxy_list)
+        party_id   = get_party_id(hs, mnemonic)
+        if not party_id:
+            _log("party_id failed")
+            return None
+
+        signing_key, _ = build_keypair_from_mnemonic(mnemonic)
+        cantor_token   = cantor_login(hs, party_id, signing_key)
+        if not cantor_token:
+            _log("cantor login failed")
+            return None
+
+        vector_token = vector_login(hs, party_id)
+        if not vector_token:
+            _log("vector login failed")
+            return None
+
+        canton, _, usdcx_before, ceth_before = get_balance(hs, cantor_token)
+        _log(f"Balance: CC={canton:.4f} cETH={ceth_before:.6f} USDCx={usdcx_before:.4f}")
+
+        # ── Step 1: CC → cETH (kalau CC cukup) ──────────────────
+        if canton >= MIN_CC_TO_SELL:
+            sell_amount = round(canton * 0.997 - 0.05, 6)
+            _log(f"Selling {sell_amount:.4f} CC → cETH...")
+            result = safe_create_prepare_execute(
+                hs, cantor_token, vector_token,
+                signing_key, "SELL", sell_amount, party_id
+            )
+            if result not in ("SERVICE_DOWN", "SKIP_CYCLE", None):
+                _log("CC → cETH done, waiting 30s...")
+                time.sleep(30)
+                # refresh token setelah wait
+                cantor_token = cantor_login(hs, party_id, signing_key)
+
+        # ── Step 2: cETH → USDCx ────────────────────────────────
+        _, _, _, ceth_now = get_balance(hs, cantor_token)
+        _log(f"cETH available: {ceth_now:.6f}")
+
+        if ceth_now < MIN_CETH_TO_SWAP:
+            _log(f"cETH terlalu kecil ({ceth_now:.6f}), skip")
+            _, _, usdcx_after, _ = get_balance(hs, cantor_token)
+            return {
+                "idx":          idx,
+                "usdc_before":  usdcx_before,
+                "usdc_after":   usdcx_after,
+                "usdc_gained":  usdcx_after - usdcx_before,
+                "skipped":      True,
+            }
+
+        swap_amount = round(ceth_now - 0.000001, 6)
+        _log(f"Swapping {swap_amount:.6f} cETH → USDCx...")
+
+        gained = _swap_ceth_to_usdc(
+            hs, cantor_token, vector_token,
+            signing_key, swap_amount, party_id, _log
+        )
+
+        _, _, usdcx_after, _ = get_balance(hs, cantor_token)
+
+        if gained and gained != "SERVICE_DOWN":
+            _log(f"✅ Swap done! USDCx: {usdcx_before:.4f} → {usdcx_after:.4f} (+{usdcx_after-usdcx_before:.4f})")
+        else:
+            _log(f"Swap failed or service down")
+
+        return {
+            "idx":         idx,
+            "usdc_before": usdcx_before,
+            "usdc_after":  usdcx_after,
+            "usdc_gained": usdcx_after - usdcx_before,
+            "skipped":     False,
+            "error":       gained if gained in (None, "SERVICE_DOWN") else None,
+        }
+
+    except Exception as e:
+        if log:
+            log(f"[{idx}] Exception: {e}")
+        return None
+    finally:
+        try:
+            hs.close()
+        except Exception:
+            pass
+
+
+def run_swap_all(mnemonics, proxy_list, progress_callback=None):
+    """
+    Jalankan swap_all_to_usdc_single untuk semua wallet secara parallel.
+    Mirip dengan run_checker.
+    """
+    results     = []
+    total_gained = 0.0
+    failed      = 0
+    skipped     = 0
+    max_threads = min(10, len(mnemonics)) if mnemonics else 1  # lebih konservatif dari checker
+
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        futures = {
+            executor.submit(swap_all_to_usdc_single, i+1, m, proxy_list): i
+            for i, m in enumerate(mnemonics)
+        }
+        done_count = 0
+        for f in as_completed(futures):
+            done_count += 1
+            res = f.result()
+            if res:
+                results.append(res)
+                total_gained += res.get("usdc_gained", 0)
+                if res.get("skipped"):
+                    skipped += 1
+            else:
+                failed += 1
+            if progress_callback:
+                progress_callback(done_count, len(mnemonics))
+
+    return {
+        "total":        len(mnemonics),
+        "success":      len(results) - skipped,
+        "skipped":      skipped,
+        "failed":       failed,
+        "total_gained": total_gained,
+        "accounts":     results,
+    }
